@@ -4,6 +4,7 @@
 #include "../../util/pod/fd_pod_format.h"
 #include "../../discof/replay/fd_exec.h"
 #include "../../flamenco/capture/fd_capture_ctx.h"
+#include "fd_exec_geyser.h"
 #include "../../flamenco/runtime/fd_bank.h"
 #include "../../flamenco/runtime/fd_runtime.h"
 #include "../../flamenco/runtime/fd_acc_pool.h"
@@ -35,6 +36,7 @@ typedef struct fd_exec_tile_ctx {
   link_ctx_t            replay_in[ 1 ];
   link_ctx_t            exec_replay_out[ 1 ]; /* TODO: Remove with solcap v2 */
   link_ctx_t            exec_sig_out[ 1 ];
+  link_ctx_t            geyser_out[ 1 ];      /* Output to fd-geyser process */
 
   fd_sha512_t           sha_mem[ FD_TXN_ACTUAL_SIG_MAX ];
   fd_sha512_t *         sha_lj[ FD_TXN_ACTUAL_SIG_MAX ];
@@ -152,6 +154,35 @@ publish_txn_finalized_msg( fd_exec_tile_ctx_t * ctx,
   ctx->exec_replay_out->chunk = fd_dcache_compact_next( ctx->exec_replay_out->chunk, sizeof(*msg), ctx->exec_replay_out->chunk0, ctx->exec_replay_out->wmark );
 }
 
+/* Publish the geyser message to the fd-geyser process */
+static void
+publish_geyser_msg( fd_exec_tile_ctx_t *     ctx,
+                    fd_stem_context_t *      stem,
+                    fd_exec_txn_exec_msg_t * exec_msg ) {
+  if( FD_UNLIKELY( ctx->geyser_out->idx==ULONG_MAX ) ) return;
+
+  fd_exec_geyser_msg_t * msg = fd_chunk_to_laddr( ctx->geyser_out->mem, ctx->geyser_out->chunk );
+
+  msg->slot                  = ctx->slot;
+  msg->txn_idx               = ctx->txn_idx;
+  msg->bank_idx              = ctx->bank->idx;
+  msg->is_success            = ctx->txn_out.err.is_committable;
+  msg->entry_idx             = exec_msg->entry_idx;
+  msg->is_last_txn_in_entry  = exec_msg->is_last_txn_in_entry;
+  msg->is_last_entry_in_slot = exec_msg->is_last_entry_in_slot;
+
+  /* Copy transaction payload */
+  fd_memcpy( &msg->txn, ctx->txn_in.txn, sizeof(fd_txn_p_t) );
+
+  fd_stem_publish( stem, ctx->geyser_out->idx, 0UL, ctx->geyser_out->chunk,
+                   sizeof(fd_exec_geyser_msg_t), 0UL, 0UL, 0UL );
+
+  ctx->geyser_out->chunk = fd_dcache_compact_next( ctx->geyser_out->chunk,
+                                                    sizeof(fd_exec_geyser_msg_t),
+                                                    ctx->geyser_out->chunk0,
+                                                    ctx->geyser_out->wmark );
+}
+
 static inline int
 returnable_frag( fd_exec_tile_ctx_t * ctx,
                  ulong                in_idx,
@@ -207,6 +238,9 @@ returnable_frag( fd_exec_tile_ctx_t * ctx,
         ctx->dispatch_time_comp = tspub;
         ctx->slot = fd_bank_slot_get( ctx->bank );
         publish_txn_finalized_msg( ctx, stem );
+
+        /* Publish to geyser if link is configured. */
+        publish_geyser_msg( ctx, stem, msg );
 
         /* Update metrics */
         ulong setup_dt  = (ulong)ctx->txn_out.details.exec_start_timestamp   - (ulong)ctx->txn_out.details.prep_start_timestamp;
@@ -309,6 +343,16 @@ unprivileged_init( fd_topo_t *      topo,
     ctx->exec_sig_out->chunk0 = fd_dcache_compact_chunk0( ctx->exec_sig_out->mem, exec_sig_link->dcache );
     ctx->exec_sig_out->wmark  = fd_dcache_compact_wmark( ctx->exec_sig_out->mem, exec_sig_link->dcache, exec_sig_link->mtu );
     ctx->exec_sig_out->chunk  = ctx->exec_sig_out->chunk0;
+  }
+
+  /* Setup the geyser output link (optional - only present when fd-geyser is running). */
+  ctx->geyser_out->idx = fd_topo_find_tile_out_link( topo, tile, "geyser", ctx->tile_idx );
+  if( FD_LIKELY( ctx->geyser_out->idx!=ULONG_MAX ) ) {
+    fd_topo_link_t * geyser_link = &topo->links[ tile->out_link_id[ ctx->geyser_out->idx ] ];
+    ctx->geyser_out->mem    = topo->workspaces[ topo->objs[ geyser_link->dcache_obj_id ].wksp_id ].wksp;
+    ctx->geyser_out->chunk0 = fd_dcache_compact_chunk0( ctx->geyser_out->mem, geyser_link->dcache );
+    ctx->geyser_out->wmark  = fd_dcache_compact_wmark( ctx->geyser_out->mem, geyser_link->dcache, geyser_link->mtu );
+    ctx->geyser_out->chunk  = ctx->geyser_out->chunk0;
   }
 
   /********************************************************************/

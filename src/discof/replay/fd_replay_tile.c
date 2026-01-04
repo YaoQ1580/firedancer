@@ -1555,6 +1555,10 @@ dispatch_task( fd_replay_tile_t *  ctx,
       memcpy( &exec_msg->txn, txn_p, sizeof(fd_txn_p_t) );
       exec_msg->bank_idx = task->txn_exec->bank_idx;
       exec_msg->txn_idx  = task->txn_exec->txn_idx;
+      /* Entry boundary information for geyser */
+      exec_msg->entry_idx             = task->txn_exec->entry_idx;
+      exec_msg->is_last_txn_in_entry  = task->txn_exec->is_last_txn_in_entry;
+      exec_msg->is_last_entry_in_slot = task->txn_exec->is_last_entry_in_slot;
       if( FD_UNLIKELY( ctx->capture_ctx ) ) {
         exec_msg->capture_txn_idx = ctx->capture_ctx->current_txn_idx++;
       }

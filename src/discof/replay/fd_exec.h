@@ -25,6 +25,11 @@ struct fd_exec_txn_exec_msg {
   /* Used currently by solcap to maintain ordering of messages
      this will change to using txn sigs eventually */
   ulong      capture_txn_idx;
+
+  /* Entry boundary information for geyser */
+  ulong      entry_idx;            /* Index of entry (microblock) within slot */
+  uint       is_last_txn_in_entry; /* 1 if this is the last txn in the entry */
+  uint       is_last_entry_in_slot;/* 1 if this entry is the last in the slot */
 };
 typedef struct fd_exec_txn_exec_msg fd_exec_txn_exec_msg_t;
 

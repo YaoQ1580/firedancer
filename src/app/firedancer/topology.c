@@ -27,6 +27,7 @@
 #include "../../flamenco/runtime/fd_acc_pool.h"
 #include "../../vinyl/meta/fd_vinyl_meta.h"
 #include "../../vinyl/io/fd_vinyl_io.h" /* FD_VINYL_IO_TYPE_* */
+#include "../../discof/exec/fd_exec_geyser.h"  /* fd_exec_geyser_msg_t for geyser link */
 
 #include <sys/random.h>
 #include <sys/types.h>
@@ -443,6 +444,14 @@ fd_topo_initialize( config_t * config ) {
 
   fd_topob_wksp( topo, "exec_replay"  );
 
+  /* Create indexed geyser workspaces for external geyser consumer (fd-geyser process)
+     Name limited to 12 chars: "geyser_N" where N is exec tile index */
+  for( ulong i = 0; i < exec_tile_cnt; i++ ) {
+    char wksp_name[32];
+    snprintf( wksp_name, sizeof(wksp_name), "geyser_%lu", i );
+    fd_topob_wksp( topo, wksp_name );
+  }
+
   if( FD_LIKELY( snapshots_enabled ) ) {
     fd_topob_wksp( topo, "snapct"      );
     fd_topob_wksp( topo, "snapld"      );
@@ -562,6 +571,16 @@ fd_topo_initialize( config_t * config ) {
 
   FOR(exec_tile_cnt)   fd_topob_link( topo, "exec_sig",     "exec_sig",     16384UL,                                  64UL,                          1UL );
   FOR(exec_tile_cnt)   fd_topob_link( topo, "exec_replay",  "exec_replay",  16384UL,                                  sizeof(fd_exec_task_done_msg_t), 1UL );
+
+  /* Geyser links for external geyser consumer (fd-geyser process).
+     Set permit_no_consumers because the consumer is an external process, not a tile.
+     Link name "geyser" matches workspace name pattern "geyser_N" */
+  for( ulong i = 0; i < exec_tile_cnt; i++ ) {
+    char wksp_name[32];
+    snprintf( wksp_name, sizeof(wksp_name), "geyser_%lu", i );
+    fd_topo_link_t * link = fd_topob_link( topo, "geyser", wksp_name, 16384UL, sizeof(fd_exec_geyser_msg_t), 1UL );
+    link->permit_no_consumers = 1;
+  }
 
   ushort parsed_tile_to_cpu[ FD_TILE_MAX ];
   /* Unassigned tiles will be floating, unless auto topology is enabled. */
@@ -804,6 +823,7 @@ fd_topo_initialize( config_t * config ) {
   FOR(exec_tile_cnt)   fd_topob_tile_in (   topo, "pack",    0UL,          "metric_in", "exec_sig",     i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   FOR(exec_tile_cnt)   fd_topob_tile_out(   topo, "exec",    i,                         "exec_sig",     i                                                  );
   FOR(exec_tile_cnt)   fd_topob_tile_out(   topo, "exec",    i,                         "exec_replay",  i                                                  );
+  FOR(exec_tile_cnt)   fd_topob_tile_out(   topo, "exec",    i,                         "geyser",       i                                                  );  /* Output to external geyser */
   FOR(exec_tile_cnt)   fd_topob_tile_in (   topo, "replay",  0UL,          "metric_in", "exec_replay",  i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
 
 

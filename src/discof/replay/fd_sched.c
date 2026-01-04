@@ -68,12 +68,15 @@ struct fd_sched_block {
   long                txn_disp_ticks[ FD_MAX_TXN_PER_SLOT ]; /* Indexed by parse order. */
   long                txn_done_ticks[ FD_MAX_TXN_PER_SLOT ]; /* Indexed by parse order. */
   fd_ed25519_sig_t    txn_sigs[ FD_MAX_TXN_PER_SLOT ]; /* Indexed by parse order. */
+  ulong               txn_entry_idx[ FD_MAX_TXN_PER_SLOT ]; /* Entry index for each txn, indexed by parse order. */
+  uint                txn_is_last_in_entry[ FD_MAX_TXN_PER_SLOT ]; /* 1 if last txn in entry, indexed by parse order. */
 
   /* Parser state. */
   uchar               txn[ FD_TXN_MAX_SZ ] __attribute__((aligned(alignof(fd_txn_t))));
   fd_hash_t           poh;          /* Latest PoH hash we've seen from the ingested FEC sets. */
   ulong               mblks_rem;    /* Number of microblocks remaining in the current batch. */
   ulong               txns_rem;     /* Number of transactions remaining in the current microblock. */
+  ulong               entry_idx;    /* Current entry (microblock) index within slot for geyser */
   fd_acct_addr_t      aluts[ 256 ]; /* Resolve ALUT accounts into this buffer for more parallelism. */
   uint                fec_buf_sz;   /* Size of the fec_buf in bytes. */
   uint                fec_buf_soff; /* Starting offset into fec_buf for unparsed transactions. */
@@ -832,6 +835,15 @@ fd_sched_task_next_ready( fd_sched_t * sched, fd_sched_task_t * out ) {
     out->txn_exec->exec_idx = exec_tile_idx0;
     FD_TEST( out->txn_exec->exec_idx!=ULONG_MAX );
 
+    /* Entry boundary information for geyser.
+       Use per-txn entry info stored during parsing for accurate boundaries. */
+    ulong parse_idx = sched->txn_idx_to_parse_idx[ out->txn_exec->txn_idx ];
+    out->txn_exec->entry_idx            = block->txn_entry_idx[ parse_idx ];
+    out->txn_exec->is_last_txn_in_entry = block->txn_is_last_in_entry[ parse_idx ];
+    out->txn_exec->is_last_entry_in_slot= (block->txn_is_last_in_entry[ parse_idx ] &&
+                                           block->fec_eos &&
+                                           (parse_idx + 1U == block->txn_parsed_cnt));
+
     long now = fd_tickcount();
     ulong delta = (ulong)(now-sched->txn_in_flight_last_tick);
     ulong txn_exec_busy_cnt = sched->exec_cnt-(ulong)fd_ulong_popcnt( exec_ready_bitset0 );
@@ -1334,6 +1346,7 @@ add_block( fd_sched_t * sched,
 
   block->mblks_rem    = 0UL;
   block->txns_rem     = 0UL;
+  block->entry_idx    = 0UL;  /* Initialize entry index for geyser */
   block->fec_buf_sz   = 0U;
   block->fec_buf_boff = 0U;
   block->fec_buf_soff = 0U;
@@ -1409,6 +1422,11 @@ fd_sched_parse( fd_sched_t * sched, fd_sched_block_t * block, fd_sched_alut_ctx_
       }
     }
     if( block->txns_rem==0UL && block->mblks_rem>0UL ) {
+      /* Increment entry_idx after finishing an entry (not before the first one) */
+      if( block->txn_parsed_cnt > 0U ) {
+        block->entry_idx++;
+      }
+
       CHECK_LEFT( sizeof(fd_microblock_hdr_t) );
       fd_microblock_hdr_t * hdr = (fd_microblock_hdr_t *)fd_type_pun( block->fec_buf+block->fec_buf_soff );
       block->fec_buf_soff      += (uint)sizeof(fd_microblock_hdr_t);
@@ -1515,6 +1533,9 @@ fd_sched_parse_txn( fd_sched_t * sched, fd_sched_block_t * block, fd_sched_alut_
   block->txn_idx[ block->txn_parsed_cnt ] = txn_idx;
   block->txn_disp_ticks[ block->txn_parsed_cnt ] = LONG_MAX;
   block->txn_done_ticks[ block->txn_parsed_cnt ] = LONG_MAX;
+  /* Store entry boundary info at parse time for accurate geyser reporting */
+  block->txn_entry_idx[ block->txn_parsed_cnt ] = block->entry_idx;
+  block->txn_is_last_in_entry[ block->txn_parsed_cnt ] = (block->txns_rem==1UL) ? 1U : 0U;
   block->fec_buf_soff += (uint)pay_sz;
   block->txn_parsed_cnt++;
 #if FD_SCHED_SKIP_SIGVERIFY

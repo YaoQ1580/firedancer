@@ -112,6 +112,10 @@ struct fd_sched_txn_exec {
   ulong slot;
   ulong txn_idx;
   ulong exec_idx;
+  /* Entry boundary information for geyser */
+  ulong entry_idx;            /* Index of entry (microblock) within slot */
+  uint  is_last_txn_in_entry; /* 1 if this is the last txn in the entry */
+  uint  is_last_entry_in_slot;/* 1 if this entry is the last in the slot */
 };
 typedef struct fd_sched_txn_exec fd_sched_txn_exec_t;
 
