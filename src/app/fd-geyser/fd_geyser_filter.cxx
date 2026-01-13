@@ -8,6 +8,7 @@
 
 #include "geyser.grpc.pb.h"
 #include "fd_geyser_service.hxx"
+#include "fd_compact_encoder.h"
 
 extern "C" {
 /* Use C++ safe headers - avoids fd_topo.h which uses 'new' keyword */
@@ -44,6 +45,9 @@ struct CompiledFilterAccount {
   FdHashSet owners_;  /* O(1) lookup for owner keys */
   std::optional<uint64_t> datasize_;
   bool nonempty_txn_signature_ = false;
+
+  /* Pre-computed compact encoding type (0 = no encoding, >0 = FdCompactMsgType) */
+  unsigned char compact_type_ = FD_COMPACT_MSG_RAW;
 
   /* Memcmp filters */
   struct MemcmpFilter {
@@ -126,7 +130,7 @@ public:
     return NULL;
   }
 
-  bool filterAccount( fd_pubkey_t * key, fd_account_meta_t * meta, const uchar * data, ulong data_sz );
+  unsigned char filterAccount( fd_pubkey_t * key, fd_account_meta_t * meta, const uchar * data, ulong data_sz );
   bool filterSlot( fd_replay_slot_completed_t * msg );
   bool filterTxn( fd_exec_geyser_msg_t const * msg, fd_txn_t * txn, fd_pubkey_t * accts );
   bool hasEntryFilter() const { return !entries_.empty(); }
@@ -141,16 +145,6 @@ public:
   std::vector<std::unique_ptr<CompiledFilterEntry>> entries_;
   std::vector<std::unique_ptr<CompiledFilterBlockMeta>> blocks_meta_;
   ::geyser::CommitmentLevel commitment_ = ::geyser::PROCESSED;
-
-  /* Data slice configuration (global, applies to all account updates) */
-  struct DataSlice {
-    uint64_t offset;
-    uint64_t length;
-  };
-  std::vector<DataSlice> data_slices_;
-
-  bool hasDataSlices() const { return !data_slices_.empty(); }
-  const std::vector<DataSlice>& getDataSlices() const { return data_slices_; }
 };
 
 bool
@@ -219,6 +213,13 @@ CompiledFilter::compile_internal( ::geyser::SubscribeRequest * request ) {
       a->nonempty_txn_signature_ = f.nonempty_txn_signature();
     }
 
+    /* Pre-compute compact encoding type based on filter name (called once at compile time) */
+    a->compact_type_ = fd_compact_get_type_for_filter( a->name_.c_str() );
+    if( a->compact_type_ != FD_COMPACT_MSG_RAW ) {
+      FD_LOG_NOTICE(( "Filter '%s' will use compact encoding type %d",
+                      a->name_.c_str(), (int)a->compact_type_ ));
+    }
+
     accts_.emplace_back(a);
     hasfilter = true;
   }
@@ -283,23 +284,10 @@ CompiledFilter::compile_internal( ::geyser::SubscribeRequest * request ) {
     commitment_ = request->commitment();
   }
 
-  /* Compile accounts_data_slice (global, applies to all account updates) */
-  for( int i = 0; i < request->accounts_data_slice_size(); ++i ) {
-    auto& slice = request->accounts_data_slice(i);
-    DataSlice ds;
-    ds.offset = slice.offset();
-    ds.length = slice.length();
-    data_slices_.push_back( ds );
-  }
-  if( !data_slices_.empty() ) {
-    FD_LOG_NOTICE(( "Compiled %lu data slices for account subscription",
-                    (ulong)data_slices_.size() ));
-  }
-
   return hasfilter;
 }
 
-bool
+unsigned char
 CompiledFilter::filterAccount( fd_pubkey_t * key, fd_account_meta_t * meta,
                                const uchar * data, ulong data_sz ) {
   for( auto& f : accts_ ) {
@@ -348,9 +336,10 @@ CompiledFilter::filterAccount( fd_pubkey_t * key, fd_account_meta_t * meta,
       if( !ok ) continue;
     }
 
-    return true;  /* Matched this filter */
+    /* Matched: return pre-computed compact type (0 = raw, >0 = compact encoding) */
+    return f->compact_type_;
   }
-  return false;
+  return FD_COMPACT_MSG_NO_MATCH;  /* 0xFF = no match */
 }
 
 bool
@@ -542,48 +531,6 @@ fd_geyser_filter_add_sub( fd_geyser_filter_t * filter, void * request_void, Geys
   }
 }
 
-/* Helper to apply data slices to account data.
-   Returns sliced data if filter has slices, otherwise returns original data via out pointer.
-   Uses thread-local buffer to avoid repeated heap allocations. */
-static void
-apply_data_slices( const CompiledFilter * filter,
-                   const uchar * data, ulong data_sz,
-                   const uchar ** out_data, ulong * out_sz ) {
-  if( !filter || !filter->hasDataSlices() ) {
-    /* No slices - use original data */
-    *out_data = data;
-    *out_sz = data_sz;
-    return;
-  }
-
-  /* Thread-local buffer avoids repeated heap allocations.
-     clear() only resets size, capacity is preserved for reuse. */
-  thread_local std::vector<uint8_t> sliced_buf;
-  sliced_buf.clear();
-
-  for( const auto& slice : filter->getDataSlices() ) {
-    uint64_t slice_end = slice.offset + slice.length;
-    if( slice_end <= data_sz ) {
-      /* Valid slice - append to result */
-      sliced_buf.insert( sliced_buf.end(),
-                         data + slice.offset,
-                         data + slice.offset + slice.length );
-    } else if( slice.offset < data_sz ) {
-      /* Partial slice - take available portion */
-      sliced_buf.insert( sliced_buf.end(),
-                         data + slice.offset,
-                         data + data_sz );
-    }
-    /* Out-of-bounds slices are skipped */
-  }
-
-  *out_data = sliced_buf.data();
-  *out_sz = sliced_buf.size();
-
-  FD_LOG_DEBUG(( "[DATA_SLICE] original=%lu sliced=%lu slices=%lu",
-                 data_sz, sliced_buf.size(), filter->getDataSlices().size() ));
-}
-
 void
 fd_geyser_filter_un_sub( fd_geyser_filter_t * filter, GeyserSubscribeReactor_t * reactor ) {
   std::lock_guard<std::mutex> lock( filter->mutex_ );
@@ -613,40 +560,56 @@ fd_geyser_filter::notify_account( ulong slot, fd_pubkey_t * key, fd_ed25519_sig_
 
   std::lock_guard<std::mutex> lock( mutex_ );
 
+  /* Thread-local buffer for compact encoding (avoid allocation per call) */
+  thread_local std::vector<unsigned char> compact_buf(32768);  /* 32KB, sufficient for max compact output */
+
   /* Collect Confirmed targets that need buffering (slot not yet confirmed) */
   std::vector<GeyserSubscribeReactor*> confirmed_targets;
   auto& state = slot_states_[slot];
   bool slot_confirmed = state.confirmed;
 
   for( auto& sub : subs_ ) {
-    if( !sub.filter_->filterAccount( key, meta, data, data_sz ) ) continue;
+    unsigned char compact_type = sub.filter_->filterAccount( key, meta, data, data_sz );
+    if( compact_type == FD_COMPACT_MSG_NO_MATCH ) continue;  /* No filter matched */
+
+    /* Prepare data to send: apply compact encoding if configured */
+    const uchar * final_data = data;
+    ulong final_sz = data_sz;
+
+    if( compact_type != FD_COMPACT_MSG_RAW ) {
+      /* Try compact encoding (using pre-computed type, no strcmp at runtime) */
+      ulong encoded_sz = fd_compact_encode(
+        compact_type, data, data_sz, compact_buf.data(), compact_buf.size() );
+      if( encoded_sz > 0 ) {
+        final_data = compact_buf.data();
+        final_sz = encoded_sz;
+        FD_LOG_DEBUG(( "[GRPC_SEND] compact encoded: type=%d original=%lu encoded=%lu",
+                       (int)compact_type, data_sz, encoded_sz ));
+      }
+    }
 
     /* Check subscriber's commitment level */
     if( sub.filter_->commitment_ == ::geyser::PROCESSED ) {
-      /* Processed: send immediately with data slices applied */
-      const uchar * send_data;
-      ulong send_sz;
-      apply_data_slices( sub.filter_, data, data_sz, &send_data, &send_sz );
+      /* Processed: send immediately */
       GeyserServiceImpl::updateAcctWithMarkers(
-        sub.reactor_, slot, key, sig, meta, send_data, send_sz,
+        sub.reactor_, slot, key, sig, meta, final_data, final_sz,
         end_txn_sig, geyser_msg );
     } else if( sub.filter_->commitment_ == ::geyser::CONFIRMED ) {
       if( slot_confirmed ) {
-        /* Slot already confirmed, send immediately with data slices applied */
-        const uchar * send_data;
-        ulong send_sz;
-        apply_data_slices( sub.filter_, data, data_sz, &send_data, &send_sz );
+        /* Slot already confirmed, send immediately */
         GeyserServiceImpl::updateAcctWithMarkers(
-          sub.reactor_, slot, key, sig, meta, send_data, send_sz,
+          sub.reactor_, slot, key, sig, meta, final_data, final_sz,
           end_txn_sig, geyser_msg );
       } else {
-        /* Collect target for buffering */
+        /* Collect target for buffering - store encoded data */
         confirmed_targets.push_back( sub.reactor_ );
       }
     }
   }
 
-  /* Create single pending entry with all targets (no duplicate account storage) */
+  /* Create single pending entry with all targets (no duplicate account storage)
+     Note: For confirmed buffering, we store the original data since different
+     subscriptions might have different compact_type settings */
   if( !confirmed_targets.empty() ) {
     PendingAccountUpdate pending;
     pending.key = *key;
@@ -794,24 +757,41 @@ fd_geyser_filter::flush_confirmed_updates( SlotState& state, fd_replay_slot_comp
   /* Mark slot as confirmed */
   state.confirmed = true;
 
+  /* Thread-local buffer for compact encoding */
+  thread_local std::vector<unsigned char> compact_buf(32768);  /* 32KB, sufficient for max compact output */
+
   /* Flush buffered Account updates - send directly to pre-filtered targets (no re-filtering!) */
   for( auto& pending : state.pending_accounts ) {
     for( auto* reactor : pending.target_reactors ) {
       /* O(1) check if reactor is still valid (subscriber may have disconnected) */
       if( active_reactors_.find( reactor ) == active_reactors_.end() ) continue;
 
-      /* O(1) lookup for filter to apply data slices */
+      /* O(1) lookup for filter to get compact type */
       CompiledFilter * target_filter = nullptr;
       auto filter_it = reactor_to_filter_.find( reactor );
       if( filter_it != reactor_to_filter_.end() ) {
         target_filter = filter_it->second;
       }
 
-      /* Apply data slices if configured */
-      const uchar * send_data;
-      ulong send_sz;
-      apply_data_slices( target_filter, pending.data.data(), pending.data.size(),
-                         &send_data, &send_sz );
+      /* Apply compact encoding if configured */
+      const uchar * send_data = pending.data.data();
+      ulong send_sz = pending.data.size();
+
+      if( target_filter ) {
+        /* Re-filter to get compact_type (stored data is original, need to re-encode) */
+        unsigned char compact_type = target_filter->filterAccount(
+          (fd_pubkey_t*)&pending.key, (fd_account_meta_t*)&pending.meta,
+          pending.data.data(), pending.data.size() );
+        if( compact_type != FD_COMPACT_MSG_RAW && compact_type != FD_COMPACT_MSG_NO_MATCH ) {
+          ulong encoded_sz = fd_compact_encode(
+            compact_type, pending.data.data(), pending.data.size(),
+            compact_buf.data(), compact_buf.size() );
+          if( encoded_sz > 0 ) {
+            send_data = compact_buf.data();
+            send_sz = encoded_sz;
+          }
+        }
+      }
 
       GeyserServiceImpl::updateAcctWithMarkers(
         reactor, msg->slot, &pending.key,

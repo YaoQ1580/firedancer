@@ -1,6 +1,7 @@
 #include "local-pragmas.h"
 
 #include "fd_geyser_service.hxx"
+#include "fd_compact_encoder.h"
 
 #include <iostream>
 #include <fstream>
@@ -50,6 +51,15 @@ static void log_level_signal_handler(int sig) {
     fd_log_level_logfile_set(2);  /* 2 = NOTICE */
     FD_LOG_WARNING(("Received SIGUSR2: DEBUG logging DISABLED"));
   }
+}
+
+/* Signal handler for compact encoding toggle
+   SIGHUP: Toggle compact encoding on/off */
+static void compact_toggle_signal_handler(int sig) {
+  (void)sig;
+  fd_compact_toggle();
+  FD_LOG_WARNING(("Received SIGHUP: Compact encoding %s",
+                  fd_compact_is_enabled() ? "ENABLED" : "DISABLED"));
 }
 
 /* Simple TOML config parser - extracts only the fields we need */
@@ -181,7 +191,11 @@ int main(int argc, char** argv) {
   /* Register signal handlers for dynamic log level switching */
   std::signal(SIGUSR1, log_level_signal_handler);
   std::signal(SIGUSR2, log_level_signal_handler);
-  FD_LOG_NOTICE(( "Signal handlers registered: kill -USR1 <pid> to enable DEBUG, kill -USR2 <pid> to disable" ));
+  std::signal(SIGHUP, compact_toggle_signal_handler);
+  FD_LOG_NOTICE(( "Signal handlers registered:" ));
+  FD_LOG_NOTICE(( "  kill -USR1 <pid>  Enable DEBUG logging" ));
+  FD_LOG_NOTICE(( "  kill -USR2 <pid>  Disable DEBUG logging" ));
+  FD_LOG_NOTICE(( "  kill -HUP <pid>   Toggle compact encoding" ));
 
   /* Parse config file if provided */
   FdGeyserConfig file_cfg;

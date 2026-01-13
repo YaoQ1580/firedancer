@@ -33,5 +33,5 @@ GRPC_LIBS += $(PKG)/lib/libutf8_validity.a
 GRPC_LIBS += -pthread -ldl -lsystemd
 
 # Build the fd_geyser binary
-# Sources: main, service, filter, poller, and generated protobuf files
-$(call make-bin,fd_geyser,fd_geyser_main fd_geyser_service fd_geyser_filter fd_geyser_poller geyser.grpc.pb geyser.pb solana-storage.pb,fd_discof fd_disco fd_flamenco fd_reedsol fd_funk fd_tango fd_choreo fd_waltz fd_ballet fd_util,$(SECP256K1_LIBS) $(GRPC_LIBS))
+# Sources: main, service, filter, poller, compact encoder, and generated protobuf files
+$(call make-bin,fd_geyser,fd_geyser_main fd_geyser_service fd_geyser_filter fd_geyser_poller fd_compact_encoder geyser.grpc.pb geyser.pb solana-storage.pb,fd_discof fd_disco fd_flamenco fd_reedsol fd_funk fd_tango fd_choreo fd_waltz fd_ballet fd_util,$(SECP256K1_LIBS) $(GRPC_LIBS))
