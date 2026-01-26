@@ -107,7 +107,13 @@ struct PendingTxnUpdate {
   ulong txn_sz;
   std::vector<fd_pubkey_t> accts;
   fd_ed25519_sig_t sig;
+  std::vector<uchar> payload;                             /* Raw transaction payload for ALT data */
   bool is_success;
+  ulong fee;                                              /* Total fee in lamports */
+  int txn_err;                                            /* FD_RUNTIME_TXN_ERR_* */
+  int instr_err;                                          /* FD_EXECUTOR_INSTR_ERR_* */
+  int instr_err_idx;                                      /* Failed instruction index */
+  uint custom_err;                                        /* Custom program error code */
   std::vector<GeyserSubscribeReactor*> target_reactors;  /* Pre-filtered targets */
 };
 
@@ -132,7 +138,7 @@ public:
 
   unsigned char filterAccount( fd_pubkey_t * key, fd_account_meta_t * meta, const uchar * data, ulong data_sz );
   bool filterSlot( fd_replay_slot_completed_t * msg );
-  bool filterTxn( fd_exec_geyser_msg_t const * msg, fd_txn_t * txn, fd_pubkey_t * accts );
+  bool filterTxn( fd_exec_geyser_msg_t const * msg, fd_txn_t * txn, fd_pubkey_t * accts, uint total_acct_cnt );
   bool hasEntryFilter() const { return !entries_.empty(); }
   bool hasBlockMetaFilter() const { return !blocks_meta_.empty(); }
   bool hasTxnFilter() const { return !txns_.empty(); }
@@ -349,13 +355,13 @@ CompiledFilter::filterSlot( fd_replay_slot_completed_t * msg ) {
 }
 
 bool
-CompiledFilter::filterTxn( fd_exec_geyser_msg_t const * msg, fd_txn_t * txn, fd_pubkey_t * accts ) {
+CompiledFilter::filterTxn( fd_exec_geyser_msg_t const * msg, fd_txn_t * txn, fd_pubkey_t * accts, uint total_acct_cnt ) {
   (void)msg;
   for( auto& f : txns_ ) {
-    /* Check account_include - O(n) where n = acct_addr_cnt */
+    /* Check account_include - O(n) where n = total_acct_cnt (static + ALT) */
     if( !f->acct_include_.empty() ) {
       bool found = false;
-      for( uint j = 0; j < txn->acct_addr_cnt; ++j ) {
+      for( uint j = 0; j < total_acct_cnt; ++j ) {
         if( f->acct_include_.find( accts[j] ) != f->acct_include_.end() ) {
           found = true;
           break;
@@ -364,10 +370,10 @@ CompiledFilter::filterTxn( fd_exec_geyser_msg_t const * msg, fd_txn_t * txn, fd_
       if( !found ) continue;
     }
 
-    /* Check account_exclude - O(n) where n = acct_addr_cnt */
+    /* Check account_exclude - O(n) where n = total_acct_cnt (static + ALT) */
     if( !f->acct_exclude_.empty() ) {
       bool excluded = false;
-      for( uint j = 0; j < txn->acct_addr_cnt; ++j ) {
+      for( uint j = 0; j < total_acct_cnt; ++j ) {
         if( f->acct_exclude_.find( accts[j] ) != f->acct_exclude_.end() ) {
           excluded = true;
           break;
@@ -376,11 +382,11 @@ CompiledFilter::filterTxn( fd_exec_geyser_msg_t const * msg, fd_txn_t * txn, fd_
       if( excluded ) continue;
     }
 
-    /* Check account_required - must check each required is in txn */
+    /* Check account_required - must check each required is in txn (static + ALT) */
     bool all_required = true;
     for( auto& h : f->acct_required_ ) {
       bool found = false;
-      for( uint j = 0; j < txn->acct_addr_cnt; ++j ) {
+      for( uint j = 0; j < total_acct_cnt; ++j ) {
         if( !memcmp( h.uc, accts[j].uc, 32 ) ) {
           found = true;
           break;
@@ -393,7 +399,7 @@ CompiledFilter::filterTxn( fd_exec_geyser_msg_t const * msg, fd_txn_t * txn, fd_
     }
     if( !all_required ) continue;
 
-    /* Check vote filter */
+    /* Check vote filter (program_id is always in static accounts) */
     if( f->vote_.has_value() ) {
       /* Detect if any instruction invokes the vote program */
       bool is_vote = false;
@@ -457,8 +463,8 @@ struct fd_geyser_filter {
   void notify_slot( fd_replay_slot_completed_t * msg, ::geyser::CommitmentLevel event_level );
   void notify_entry( ulong slot, ulong entry_idx );
   void notify_txn( ulong slot, fd_exec_geyser_msg_t const * msg,
-                   fd_txn_t * txn, fd_pubkey_t * accts,
-                   fd_ed25519_sig_t const * sigs );
+                   fd_txn_t * txn, fd_pubkey_t * accts, uint total_acct_cnt,
+                   fd_ed25519_sig_t const * sigs, uchar const * payload, ulong payload_sz );
   void notify_block_meta( fd_replay_slot_completed_t * msg, ::geyser::CommitmentLevel event_level );
   void flush_confirmed_updates( SlotState& state, fd_replay_slot_completed_t * msg );
 };
@@ -677,8 +683,8 @@ fd_geyser_filter::notify_entry( ulong slot, ulong entry_idx ) {
 
 void
 fd_geyser_filter::notify_txn( ulong slot, fd_exec_geyser_msg_t const * msg,
-                               fd_txn_t * txn, fd_pubkey_t * accts,
-                               fd_ed25519_sig_t const * sigs ) {
+                               fd_txn_t * txn, fd_pubkey_t * accts, uint total_acct_cnt,
+                               fd_ed25519_sig_t const * sigs, uchar const * payload, ulong payload_sz ) {
   std::lock_guard<std::mutex> lock( mutex_ );
 
   /* Collect Confirmed targets that need buffering (slot not yet confirmed) */
@@ -688,7 +694,7 @@ fd_geyser_filter::notify_txn( ulong slot, fd_exec_geyser_msg_t const * msg,
 
   for( auto& sub : subs_ ) {
     if( !sub.filter_->hasTxnFilter() ) continue;
-    if( !sub.filter_->filterTxn( msg, txn, accts ) ) continue;
+    if( !sub.filter_->filterTxn( msg, txn, accts, total_acct_cnt ) ) continue;
 
     /* Check subscriber's commitment level */
     if( sub.filter_->commitment_ == ::geyser::PROCESSED ) {
@@ -696,14 +702,20 @@ fd_geyser_filter::notify_txn( ulong slot, fd_exec_geyser_msg_t const * msg,
       fd_replay_slot_completed_t slot_msg;
       memset( &slot_msg, 0, sizeof(slot_msg) );
       slot_msg.slot = slot;
-      GeyserServiceImpl::updateTxn( sub.reactor_, &slot_msg, txn, accts, sigs );
+      GeyserServiceImpl::updateTxn( sub.reactor_, &slot_msg, txn, accts, sigs, payload,
+                                    msg->is_success, msg->fee,
+                                    msg->txn_err, msg->instr_err,
+                                    msg->instr_err_idx, msg->custom_err );
     } else if( sub.filter_->commitment_ == ::geyser::CONFIRMED ) {
       if( slot_confirmed ) {
         /* Slot already confirmed, send immediately */
         fd_replay_slot_completed_t slot_msg;
         memset( &slot_msg, 0, sizeof(slot_msg) );
         slot_msg.slot = slot;
-        GeyserServiceImpl::updateTxn( sub.reactor_, &slot_msg, txn, accts, sigs );
+        GeyserServiceImpl::updateTxn( sub.reactor_, &slot_msg, txn, accts, sigs, payload,
+                                      msg->is_success, msg->fee,
+                                      msg->txn_err, msg->instr_err,
+                                      msg->instr_err_idx, msg->custom_err );
       } else {
         /* Collect target for buffering */
         confirmed_targets.push_back( sub.reactor_ );
@@ -718,9 +730,17 @@ fd_geyser_filter::notify_txn( ulong slot, fd_exec_geyser_msg_t const * msg,
     ulong txn_sz = fd_txn_footprint( txn->instr_cnt, txn->addr_table_lookup_cnt );
     memcpy( pending.txn_parsed, txn, txn_sz );
     pending.txn_sz = txn_sz;
-    pending.accts.assign( accts, accts + txn->acct_addr_cnt );
+    /* Store all accounts including ALT-resolved ones */
+    pending.accts.assign( accts, accts + total_acct_cnt );
     memcpy( &pending.sig, sigs, sizeof(fd_ed25519_sig_t) );
+    /* Store raw payload for ALT data extraction */
+    pending.payload.assign( payload, payload + payload_sz );
     pending.is_success = msg->is_success;
+    pending.fee = msg->fee;
+    pending.txn_err = msg->txn_err;
+    pending.instr_err = msg->instr_err;
+    pending.instr_err_idx = msg->instr_err_idx;
+    pending.custom_err = msg->custom_err;
     pending.target_reactors = std::move( confirmed_targets );
     state.pending_txns.push_back( std::move(pending) );
   }
@@ -816,7 +836,14 @@ fd_geyser_filter::flush_confirmed_updates( SlotState& state, fd_replay_slot_comp
       slot_msg.slot = msg->slot;
       GeyserServiceImpl::updateTxn( reactor, &slot_msg, txn,
                                     const_cast<fd_pubkey_t*>(pending.accts.data()),
-                                    &pending.sig );
+                                    &pending.sig,
+                                    pending.payload.empty() ? nullptr : pending.payload.data(),
+                                    pending.is_success,
+                                    pending.fee,
+                                    pending.txn_err,
+                                    pending.instr_err,
+                                    pending.instr_err_idx,
+                                    pending.custom_err );
     }
   }
   state.pending_txns.clear();
@@ -842,13 +869,14 @@ fd_geyser_filter_notify_txn( fd_geyser_filter_t * filter, fd_exec_geyser_msg_t c
   }
   fd_txn_t * txn = (fd_txn_t *)txn_out;
 
-  fd_pubkey_t * accts = (fd_pubkey_t *)( txn_p->payload + txn->acct_addr_off );
+  /* Static accounts from payload */
+  fd_pubkey_t * static_accts = (fd_pubkey_t *)( txn_p->payload + txn->acct_addr_off );
   fd_ed25519_sig_t const * sigs = (fd_ed25519_sig_t const *)( txn_p->payload + txn->signature_off );
 
   char sig_b58[FD_BASE58_ENCODED_64_SZ];
   fd_base58_encode_64( (uchar const *)sigs, NULL, sig_b58 );
-  FD_LOG_DEBUG(( "[NOTIFY] txn_notify slot=%lu txn_idx=%lu acct_cnt=%u sig=%s is_success=%d",
-                       msg->slot, msg->txn_idx, txn->acct_addr_cnt, sig_b58, msg->is_success ));
+  FD_LOG_DEBUG(( "[NOTIFY] txn_notify slot=%lu txn_idx=%lu sig=%s is_success=%d txn_err=%d alt_acct_cnt=%u",
+                       msg->slot, msg->txn_idx, sig_b58, msg->is_success, msg->txn_err, msg->alt_acct_cnt ));
 
   /* Query funk for the transaction's funk_txn */
   fd_funk_txn_xid_t xid;
@@ -863,10 +891,21 @@ fd_geyser_filter_notify_txn( fd_geyser_filter_t * filter, fd_exec_geyser_msg_t c
   }
   fd_funk_txn_t * funk_txn = fd_funk_txn_map_query_ele( txn_query );
 
-  /* Process writable accounts */
+  /* Total account count = static + ALT */
+  int total_acct_cnt = (int)txn->acct_addr_cnt + (int)msg->alt_acct_cnt;
+
+  /* Build combined account array (static accounts + ALT accounts) */
+  fd_pubkey_t all_accts[FD_TXN_ACCT_ADDR_MAX];
+  memcpy( all_accts, static_accts, txn->acct_addr_cnt * sizeof(fd_pubkey_t) );
+  if( msg->alt_acct_cnt > 0 ) {
+    memcpy( &all_accts[txn->acct_addr_cnt], msg->alt_accts, msg->alt_acct_cnt * sizeof(fd_pubkey_t) );
+  }
+
+  /* Process writable accounts (static + ALT) */
   int writable_cnt = 0;
   int writable_accts[FD_TXN_ACCT_ADDR_MAX];
 
+  /* Static writable accounts */
   for( int i = 0; i < (int)txn->acct_addr_cnt; i++ ) {
     bool writable = (( i < (int)txn->signature_cnt - (int)txn->readonly_signed_cnt ) ||
                      (( i >= (int)txn->signature_cnt ) &&
@@ -876,12 +915,18 @@ fd_geyser_filter_notify_txn( fd_geyser_filter_t * filter, fd_exec_geyser_msg_t c
     }
   }
 
+  /* ALT writable accounts: ALT accounts are ordered as writable first, then readonly.
+     The number of writable ALT accounts is stored in txn->addr_table_adtl_writable_cnt. */
+  for( int i = 0; i < (int)txn->addr_table_adtl_writable_cnt; i++ ) {
+    writable_accts[writable_cnt++] = (int)txn->acct_addr_cnt + i;
+  }
+
   /* Notify each writable account update */
   for( int w = 0; w < writable_cnt; w++ ) {
     int i = writable_accts[w];
     bool is_last_acct = (w == writable_cnt - 1);
 
-    fd_funk_rec_key_t recid = fd_funk_acc_key( &accts[i] );
+    fd_funk_rec_key_t recid = fd_funk_acc_key( &all_accts[i] );
 
     fd_funk_rec_query_t rec_query[1];
     fd_funk_rec_t const * rec = fd_funk_rec_query_try( filter->funk_, fd_funk_txn_xid( funk_txn ), &recid, rec_query );
@@ -895,7 +940,7 @@ fd_geyser_filter_notify_txn( fd_geyser_filter_t * filter, fd_exec_geyser_msg_t c
       /* Set end_of_txn signature only on the last account */
       fd_ed25519_sig_t const * end_txn_sig = is_last_acct ? sigs : NULL;
 
-      filter->notify_account( msg->slot, &accts[i], sigs, meta, data, data_sz,
+      filter->notify_account( msg->slot, &all_accts[i], sigs, meta, data, data_sz,
                               end_txn_sig, is_last_acct ? msg : NULL );
     }
   }
@@ -905,8 +950,9 @@ fd_geyser_filter_notify_txn( fd_geyser_filter_t * filter, fd_exec_geyser_msg_t c
     filter->notify_entry( msg->slot, msg->entry_idx );
   }
 
-  /* Notify transaction subscribers */
-  filter->notify_txn( msg->slot, msg, txn, accts, sigs );
+  /* Notify transaction subscribers (pass all accounts including ALT for filtering) */
+  filter->notify_txn( msg->slot, msg, txn, all_accts, (uint)total_acct_cnt, sigs,
+                      txn_p->payload, txn_p->payload_sz );
 }
 
 /* Notify slot completion (Processed commitment) - called from replay_out */

@@ -87,10 +87,24 @@ struct fd_exec_geyser_msg {
   ulong      txn_idx;
   ulong      bank_idx;
   int        is_success;
+  ulong      fee;                 /* Total fee (execution_fee + priority_fee) in lamports. */
+
+  /* Error information (only valid when is_success == 0). */
+  int        txn_err;             /* FD_RUNTIME_TXN_ERR_* error code. */
+  int        instr_err;           /* FD_EXECUTOR_INSTR_ERR_* error code (for InstructionError). */
+  int        instr_err_idx;       /* Index of the failed instruction. */
+  uint       custom_err;          /* Custom program error code (for Custom error). */
+
   ulong      entry_idx;
   uint       is_last_txn_in_entry;
   uint       is_last_entry_in_slot;
   fd_txn_p_t txn;
+
+  /* ALT resolved accounts: For V0 transactions with Address Lookup Tables,
+     the static accounts in txn.payload only contain acct_addr_cnt accounts.
+     The additional ALT-resolved accounts are stored here. */
+  uchar          alt_acct_cnt;                        /* Number of ALT-resolved accounts (0 for legacy txns) */
+  fd_acct_addr_t alt_accts[FD_TXN_ACCT_ADDR_MAX];    /* Resolved ALT account addresses */
 };
 typedef struct fd_exec_geyser_msg fd_exec_geyser_msg_t;
 

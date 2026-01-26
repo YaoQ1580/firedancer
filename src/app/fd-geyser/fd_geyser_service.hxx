@@ -105,7 +105,14 @@ public:
     fd_replay_slot_completed_t * msg,
     fd_txn_t * txn,
     fd_pubkey_t * accts,
-    fd_ed25519_sig_t const * sigs );
+    fd_ed25519_sig_t const * sigs,
+    uchar const * payload,        /* Raw transaction payload for ALT data */
+    bool is_success,
+    ulong fee,
+    int txn_err,
+    int instr_err,
+    int instr_err_idx,
+    uint custom_err );
   static void updateBlockMeta( GeyserSubscribeReactor * reactor, fd_replay_slot_completed_t * msg );
 };
 

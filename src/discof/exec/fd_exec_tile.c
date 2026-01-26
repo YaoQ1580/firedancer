@@ -166,13 +166,49 @@ publish_geyser_msg( fd_exec_tile_ctx_t *     ctx,
   msg->slot                  = ctx->slot;
   msg->txn_idx               = ctx->txn_idx;
   msg->bank_idx              = ctx->bank->idx;
-  msg->is_success            = ctx->txn_out.err.is_committable;
+  /* is_committable means "included in block", NOT "executed successfully"
+     Use txn_err == 0 to determine actual execution success */
+  msg->is_success            = (ctx->txn_out.err.txn_err == 0);
+  msg->fee                   = ctx->txn_out.details.execution_fee + ctx->txn_out.details.priority_fee;
+
+  /* Fill error information for failed transactions */
+  if( ctx->txn_out.err.txn_err != 0 ) {
+    msg->txn_err       = ctx->txn_out.err.txn_err;
+    msg->instr_err     = ctx->txn_out.err.exec_err;
+    msg->instr_err_idx = ctx->txn_out.err.exec_err_idx;
+    msg->custom_err    = ctx->txn_out.err.custom_err;
+
+    FD_LOG_DEBUG(( "[EXEC] txn_failed slot=%lu txn_idx=%lu txn_err=%d instr_err=%d instr_idx=%d custom=%u",
+                   msg->slot, msg->txn_idx, msg->txn_err, msg->instr_err,
+                   msg->instr_err_idx, msg->custom_err ));
+  } else {
+    msg->txn_err       = 0;
+    msg->instr_err     = 0;
+    msg->instr_err_idx = 0;
+    msg->custom_err    = 0;
+  }
+
   msg->entry_idx             = exec_msg->entry_idx;
   msg->is_last_txn_in_entry  = exec_msg->is_last_txn_in_entry;
   msg->is_last_entry_in_slot = exec_msg->is_last_entry_in_slot;
 
   /* Copy transaction payload */
   fd_memcpy( &msg->txn, ctx->txn_in.txn, sizeof(fd_txn_p_t) );
+
+  /* Copy resolved ALT accounts.
+     For V0 transactions, the static accounts are in the payload (acct_addr_cnt),
+     but ALT-resolved accounts are stored in txn_out.accounts.keys[] after static accounts. */
+  fd_txn_t * txn = TXN( ctx->txn_in.txn );
+  msg->alt_acct_cnt = txn->addr_table_adtl_cnt;
+
+  if( msg->alt_acct_cnt > 0 ) {
+    /* ALT accounts are stored after static accounts in txn_out.accounts.keys[].
+       Copy them to the geyser message. */
+    ulong static_cnt = txn->acct_addr_cnt;
+    fd_memcpy( msg->alt_accts,
+               &ctx->txn_out.accounts.keys[static_cnt],
+               msg->alt_acct_cnt * sizeof(fd_acct_addr_t) );
+  }
 
   fd_stem_publish( stem, ctx->geyser_out->idx, 0UL, ctx->geyser_out->chunk,
                    sizeof(fd_exec_geyser_msg_t), 0UL, 0UL, 0UL );
